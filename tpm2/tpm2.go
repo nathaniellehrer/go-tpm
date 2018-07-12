@@ -114,6 +114,10 @@ func decodeTPMLPCRSelection(buf *bytes.Buffer) (PCRSelection, error) {
 	return sel, nil
 }
 
+// TODO(nlehrer): This is buggy:
+//  - silently fails when given negative indices in the range -1 to -7 inclusive
+//  - silently fails when given more than 8 indices at a time
+//  - crashes when a given pcr index is < -7 or > 23
 func decodeReadPCRs(in []byte) (map[int][]byte, error) {
 	buf := bytes.NewBuffer(in)
 	var updateCounter uint32
@@ -250,6 +254,24 @@ func encodePasswordAuthArea(passwords ...string) ([]byte, error) {
 	return concat(size, res)
 }
 
+func encodeAuthArea(sessionHandle tpmutil.Handle, password string) ([]byte, error) {
+	// Empty nonce.
+	var nonce []byte
+	// continueSession set, all other bits clear.
+	attributes := byte(1)
+	res, err := tpmutil.Pack(sessionHandle, nonce, attributes, []byte(password))
+	if err != nil {
+		return nil, err
+	}
+
+	size, err := tpmutil.Pack(uint32(len(res)))
+	if err != nil {
+		return nil, err
+	}
+
+	return concat(size, res)
+}
+
 func encodePCREvent(pcr tpmutil.Handle, eventData []byte) ([]byte, error) {
 	ha, err := tpmutil.Pack(pcr)
 	if err != nil {
@@ -287,15 +309,22 @@ func encodeSensitiveArea(s tpmsSensitiveCreate) ([]byte, error) {
 }
 
 // encodeCreate works for both TPM2_Create and TPM2_CreatePrimary.
-func encodeCreate(owner tpmutil.Handle, sel PCRSelection, parentPassword, ownerPassword string, pub Public) ([]byte, error) {
+func encodeCreate(
+	owner tpmutil.Handle, sel PCRSelection, parentPassword, ownerPassword string,
+	sensitiveData []byte, pub Public) ([]byte, error) {
+
 	inPublic, err := pub.encode()
 	if err != nil {
 		return nil, err
 	}
-	return encodeCreateRawTemplate(owner, sel, parentPassword, ownerPassword, inPublic)
+	return encodeCreateRawTemplate(
+		owner, sel, parentPassword, ownerPassword, sensitiveData, inPublic)
 }
 
-func encodeCreateRawTemplate(owner tpmutil.Handle, sel PCRSelection, parentPassword, ownerPassword string, inPublic []byte) ([]byte, error) {
+func encodeCreateRawTemplate(
+	owner tpmutil.Handle, sel PCRSelection, parentPassword, ownerPassword string,
+	sensitiveData, inPublic []byte) ([]byte, error) {
+
 	parent, err := tpmutil.Pack(owner)
 	if err != nil {
 		return nil, err
@@ -304,7 +333,11 @@ func encodeCreateRawTemplate(owner tpmutil.Handle, sel PCRSelection, parentPassw
 	if err != nil {
 		return nil, err
 	}
-	inSensitive, err := encodeSensitiveArea(tpmsSensitiveCreate{UserAuth: []byte(ownerPassword)})
+	inSensitive, err := encodeSensitiveArea(
+		tpmsSensitiveCreate{
+			UserAuth: []byte(ownerPassword),
+			Data:     sensitiveData,
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -373,8 +406,12 @@ func decodeCreatePrimary(in []byte) (tpmutil.Handle, crypto.PublicKey, error) {
 
 // CreatePrimary initializes the primary key in a given hierarchy.
 // Second return value is the public part of the generated key.
-func CreatePrimary(rw io.ReadWriter, owner tpmutil.Handle, sel PCRSelection, parentPassword, ownerPassword string, pub Public) (tpmutil.Handle, crypto.PublicKey, error) {
-	cmd, err := encodeCreate(owner, sel, parentPassword, ownerPassword, pub)
+func CreatePrimary(
+	rw io.ReadWriter, owner tpmutil.Handle, sel PCRSelection, parentPassword,
+	ownerPassword string, pub Public) (tpmutil.Handle, crypto.PublicKey, error) {
+
+	cmd, err := encodeCreate(
+		owner, sel, parentPassword, ownerPassword, []byte{} /*inSensitive*/, pub)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -390,7 +427,8 @@ func CreatePrimary(rw io.ReadWriter, owner tpmutil.Handle, sel PCRSelection, par
 // (TPMT_PUBLIC) provided pre-encoded. This is commonly used with key templates
 // stored in NV RAM.
 func CreatePrimaryRawTemplate(rw io.ReadWriter, owner tpmutil.Handle, sel PCRSelection, parentPassword, ownerPassword string, public []byte) (tpmutil.Handle, crypto.PublicKey, error) {
-	cmd, err := encodeCreateRawTemplate(owner, sel, parentPassword, ownerPassword, public)
+	cmd, err := encodeCreateRawTemplate(
+		owner, sel, parentPassword, ownerPassword, []byte{} /*sensitiveData*/, public)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -429,7 +467,7 @@ func ReadPublic(rw io.ReadWriter, handle tpmutil.Handle) (Public, []byte, []byte
 	return decodeReadPublic(resp)
 }
 
-func decodeCreateKey(in []byte) ([]byte, []byte, error) {
+func decodeCreate(in []byte) ([]byte, []byte, error) {
 	var resp struct {
 		Handle  tpmutil.Handle
 		Private []byte
@@ -445,7 +483,8 @@ func decodeCreateKey(in []byte) ([]byte, []byte, error) {
 // CreateKey creates a new key pair under the owner handle.
 // Returns private key and public key blobs.
 func CreateKey(rw io.ReadWriter, owner tpmutil.Handle, sel PCRSelection, parentPassword, ownerPassword string, pub Public) ([]byte, []byte, error) {
-	cmd, err := encodeCreate(owner, sel, parentPassword, ownerPassword, pub)
+	cmd, err := encodeCreate(
+		owner, sel, parentPassword, ownerPassword, []byte{} /*sensitiveData*/, pub)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -453,7 +492,34 @@ func CreateKey(rw io.ReadWriter, owner tpmutil.Handle, sel PCRSelection, parentP
 	if err != nil {
 		return nil, nil, err
 	}
-	return decodeCreateKey(resp)
+	return decodeCreate(resp)
+}
+
+// Create a data blob object that seals the sensitive data under a parent and with a
+// password and auth policy. Access to the parent must be available with a simple password.
+// Returns private and public portions of the created object.
+func Seal(
+	rw io.ReadWriter, parentHandle tpmutil.Handle, parentPassword, objectPassword string,
+	objectAuthPolicy []byte, sensitiveData []byte) ([]byte, []byte, error) {
+
+	inPublic := Public{
+		Type:       AlgKeyedHash,
+		NameAlg:    AlgSHA256,
+		Attributes: FlagFixedTPM | FlagFixedParent,
+		AuthPolicy: objectAuthPolicy,
+	}
+
+	cmd, err := encodeCreate(
+		parentHandle, PCRSelection{}, parentPassword,
+		objectPassword, sensitiveData, inPublic)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := runCommand(rw, tagSessions, cmdCreate, tpmutil.RawBytes(cmd))
+	if err != nil {
+		return nil, nil, err
+	}
+	return decodeCreate(resp)
 }
 
 func encodeLoad(parentHandle tpmutil.Handle, parentAuth string, publicBlob, privateBlob []byte) ([]byte, error) {
@@ -613,12 +679,12 @@ func StartAuthSession(rw io.ReadWriter, tpmKey, bindKey tpmutil.Handle, nonceCal
 	return decodeStartAuthSession(resp)
 }
 
-func encodeUnseal(itemHandle tpmutil.Handle, password string) ([]byte, error) {
+func encodeUnseal(sessionHandle, itemHandle tpmutil.Handle, password string) ([]byte, error) {
 	ha, err := tpmutil.Pack(itemHandle)
 	if err != nil {
 		return nil, err
 	}
-	auth, err := encodePasswordAuthArea(password)
+	auth, err := encodeAuthArea(sessionHandle, password)
 	if err != nil {
 		return nil, err
 	}
@@ -637,7 +703,23 @@ func decodeUnseal(in []byte) ([]byte, error) {
 
 // Unseal returns the data for a loaded sealed object.
 func Unseal(rw io.ReadWriter, itemHandle tpmutil.Handle, password string) ([]byte, error) {
-	cmd, err := encodeUnseal(itemHandle, password)
+	cmd, err := encodeUnseal(HandlePasswordSession, itemHandle, password)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := runCommand(rw, tagSessions, cmdUnseal, tpmutil.RawBytes(cmd))
+	if err != nil {
+		return nil, err
+	}
+	return decodeUnseal(resp)
+}
+
+// Unseal returns the data for a loaded sealed object.
+func UnsealWithSession(
+	rw io.ReadWriter,
+	sessionHandle, itemHandle tpmutil.Handle,
+	password string) ([]byte, error) {
+	cmd, err := encodeUnseal(sessionHandle, itemHandle, password)
 	if err != nil {
 		return nil, err
 	}
